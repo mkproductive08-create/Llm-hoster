@@ -3,6 +3,7 @@
 #include <cstring>
 #include <iomanip>
 #include <iostream>
+#include <algorithm>
 
 #define TAG "[SmolLMAndroid-Cpp]"
 #define LOGi(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
@@ -64,6 +65,10 @@ LLMInference::loadModel(const char *model_path, float minP, float temperature, b
         _chatTemplate = strdup(chatTemplate);
     }
     this->_storeChats = storeChats;
+
+    // Initialize the batch with the maximum context size
+    _batch = llama_batch_init(contextSize, 0, 1);
+    _prevTokens.clear();
 }
 
 void
@@ -90,26 +95,73 @@ LLMInference::startCompletion(const char *query) {
     _responseGenerationTime = 0;
     _responseNumTokens = 0;
     addChatMessage(query, "user");
-    // apply the chat-template
-    std::vector<common_chat_msg> messages;
-    for (const llama_chat_message& message : _messages) {
-        common_chat_msg msg;
-        msg.role    = message.role;
-        msg.content = message.content;
-        messages.push_back(msg);
-    }
-    common_chat_templates_inputs inputs;
-    inputs.use_jinja      = true;
-    inputs.messages       = messages;
-    auto        templates = common_chat_templates_init(_model, _chatTemplate);
-    std::string prompt    = common_chat_templates_apply(templates.get(), inputs).prompt;
-    _promptTokens = common_tokenize(llama_model_get_vocab(_model), prompt, true, true);
 
-    // create a llama_batch containing a single sequence
-    // see llama_batch_init for more details
-    _batch = new llama_batch();
-    _batch->token = _promptTokens.data();
-    _batch->n_tokens = _promptTokens.size();
+    // Sliding window: ensure context fits
+    while (true) {
+        // apply the chat-template
+        std::vector<common_chat_msg> messages;
+        for (const llama_chat_message& message : _messages) {
+            common_chat_msg msg;
+            msg.role    = message.role;
+            msg.content = message.content;
+            messages.push_back(msg);
+        }
+        common_chat_templates_inputs inputs;
+        inputs.use_jinja      = true;
+        inputs.messages       = messages;
+        auto        templates = common_chat_templates_init(_model, _chatTemplate);
+        std::string prompt    = common_chat_templates_apply(templates.get(), inputs).prompt;
+        _promptTokens = common_tokenize(llama_model_get_vocab(_model), prompt, true, true);
+
+        // Ensure we have at least some space for generation (e.g., 32 tokens)
+        if (_promptTokens.size() <= llama_n_ctx(_ctx) - 32) {
+            break;
+        }
+
+        // Remove oldest message (excluding system prompt at index 0)
+        // Check if we have messages to remove
+        if (_messages.size() > 1) {
+            // Free memory for the removed message
+            free((void*)_messages[1].role);
+            free((void*)_messages[1].content);
+            _messages.erase(_messages.begin() + 1);
+        } else {
+            // Cannot remove anymore, break to avoid infinite loop (though context might be full)
+            break;
+        }
+    }
+
+    // Incremental decoding: find common prefix
+    size_t n_past = 0;
+    size_t min_len = std::min(_prevTokens.size(), _promptTokens.size());
+    for (size_t i = 0; i < min_len; ++i) {
+        if (_prevTokens[i] != _promptTokens[i]) break;
+        n_past++;
+    }
+
+    // If context changed in the middle, truncate KV cache
+    if (n_past < _prevTokens.size()) {
+        llama_memory_seq_rm(llama_get_memory(_ctx), 0, n_past, -1);
+    }
+
+    // Only process new tokens
+    int n_new = _promptTokens.size() - n_past;
+
+    // Setup batch
+    _batch.n_tokens = n_new;
+    for (int i = 0; i < n_new; ++i) {
+        _batch.token[i] = _promptTokens[n_past + i];
+        _batch.pos[i] = n_past + i;
+        _batch.n_seq_id[i] = 1;
+        _batch.seq_id[i][0] = 0;
+        _batch.logits[i] = false;
+    }
+    if (_batch.n_tokens > 0) {
+        _batch.logits[_batch.n_tokens - 1] = true;
+    }
+
+    // Update _prevTokens
+    _prevTokens = _promptTokens;
 }
 
 // taken from:
@@ -155,13 +207,13 @@ LLMInference::completionLoop() {
     // have exceeded the context size of the model
     uint32_t contextSize = llama_n_ctx(_ctx);
     _nCtxUsed = llama_memory_seq_pos_max(llama_get_memory(_ctx), 0) + 1;
-    if (_nCtxUsed + _batch->n_tokens > contextSize) {
+    if (_nCtxUsed + _batch.n_tokens > contextSize) {
         throw std::runtime_error("context size reached");
     }
 
     auto start = ggml_time_us();
     // run the model
-    if (llama_decode(_ctx, *_batch) < 0) {
+    if (llama_decode(_ctx, _batch) < 0) {
         throw std::runtime_error("llama_decode() failed");
     }
 
@@ -170,6 +222,8 @@ LLMInference::completionLoop() {
     _currToken = llama_sampler_sample(_sampler, _ctx, -1);
     if (llama_vocab_is_eog(llama_model_get_vocab(_model), _currToken)) {
         addChatMessage(strdup(_response.data()), "assistant");
+        // Update _prevTokens with the full response to keep it in sync for next turn?
+        // Actually we have been updating _prevTokens incrementally.
         _response.clear();
         return "[EOG]";
     }
@@ -180,10 +234,14 @@ LLMInference::completionLoop() {
     _cacheResponseTokens += piece;
 
     // re-init the batch with the newly predicted token
-    // key, value pairs of all previous tokens have been cached
-    // in the KV cache
-    _batch->token = &_currToken;
-    _batch->n_tokens = 1;
+    _batch.n_tokens = 1;
+    _batch.token[0] = _currToken;
+    _batch.pos[0] = _prevTokens.size();
+    _batch.n_seq_id[0] = 1;
+    _batch.seq_id[0][0] = 0;
+    _batch.logits[0] = true;
+
+    _prevTokens.push_back(_currToken);
 
     if (_isValidUtf8(_cacheResponseTokens.c_str())) {
         _response += _cacheResponseTokens;
@@ -212,7 +270,7 @@ LLMInference::~LLMInference() {
     }
     llama_free(_ctx);
     llama_model_free(_model);
-    delete _batch;
+    llama_batch_free(_batch);
     llama_sampler_free(_sampler);
 }
 

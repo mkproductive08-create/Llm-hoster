@@ -126,7 +126,7 @@ class SmolLM {
      * file.
      */
     object DefaultInferenceParams {
-        val contextSize: Long = 1024L
+        val contextSize: Long = 5120L
         val chatTemplate: String =
             "{% for message in messages %}{% if loop.first and messages[0]['role'] != 'system' %}{{ '<|im_start|>system You are a helpful AI assistant named SmolLM, trained by Hugging Face<|im_end|> ' }}{% endif %}{{'<|im_start|>' + message['role'] + ' ' + message['content'] + '<|im_end|>' + ' '}}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant ' }}{% endif %}"
     }

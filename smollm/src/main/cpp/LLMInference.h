@@ -11,7 +11,7 @@ class LLMInference {
     llama_model*   _model;
     llama_sampler* _sampler;
     llama_token    _currToken;
-    llama_batch*   _batch;
+    llama_batch    _batch;
 
     llama_batch g_batch;
 
@@ -23,6 +23,10 @@ class LLMInference {
     // stores the tokens for the last query
     // appended to `_messages`
     std::vector<llama_token> _promptTokens;
+
+    // stores the tokens currently in the KV cache
+    std::vector<llama_token> _prevTokens;
+
     const char*              _chatTemplate;
 
     // stores the complete response for the given query
